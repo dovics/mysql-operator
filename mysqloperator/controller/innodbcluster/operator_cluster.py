@@ -665,6 +665,12 @@ def on_innodbcluster_field_router_container_options(old: dict, new: dict, body: 
         router_objects.update_options(router_deploy, cluster.parsed_spec, patcher, logger)
 
 
+def on_innodbcluster_field_router_podSpec(old: dict, new: dict, body: Body, cluster: InnoDBCluster, patcher: cluster_objects.InnoDBClusterObjectModifier, logger: Logger) -> None:
+    logger.info("on_innodbcluster_field_router_podSpec")
+    cluster.validate_spec(logger)
+    patcher.patch_deploy(router_objects.prepare_router_deployment(cluster, logger))
+
+
 # on_innodbcluster_field_router_options is safe to no go thru on_spec() as this method neither touches the STS nor the Deploy
 @kopf.on.field(consts.GROUP, consts.VERSION, consts.INNODBCLUSTER_PLURAL,
                field="spec.router.routingOptions")  # type: ignore
@@ -746,6 +752,11 @@ def on_innodbcluster_field_router_tls_secret_name(old: dict, new: dict, body: Bo
 def on_innodbcluster_field_tls_ca_secret_name(old: dict, new: dict, body: Body, cluster: InnoDBCluster, patcher: cluster_objects.InnoDBClusterObjectModifier, logger: Logger) -> None:
     logger.info("on_innodbcluster_field_tls_ca_secret_name")
     return on_sts_field_update(cluster, "spec.tlsCASecretName", patcher, logger)
+
+
+def on_innodbcluster_field_podSpec(old: dict, new: dict, body: Body, cluster: InnoDBCluster, patcher: cluster_objects.InnoDBClusterObjectModifier, logger: Logger) -> None:
+    logger.info("on_innodbcluster_field_podSpec")
+    return on_sts_field_update(cluster, "spec.podSpec", patcher, logger)
 
 
 @kopf.on.field(consts.GROUP, consts.VERSION, consts.INNODBCLUSTER_PLURAL,
@@ -1047,6 +1058,7 @@ spec_tld_handlers : OnFieldHandlerList = [\
     ("version",        lambda: None, on_innodbcluster_field_version),
     ("image",          lambda: None, on_innodbcluster_field_image),
     ("imageRepository",lambda: None, on_innodbcluster_field_image_repository),
+    ("podSpec",        lambda: {},   on_innodbcluster_field_podSpec),
     ("podLabels",      lambda: {},   on_server_pod_labels),
     ("podAnnotations", lambda: {},   on_server_pod_annotations),
     ("instances",      lambda: None, on_innodbcluster_field_instances),
@@ -1066,7 +1078,8 @@ spec_router_handlers : OnFieldHandlerList = [\
     ("version",         lambda: None, on_innodbcluster_field_router_version),
     ("options",         lambda: {},   on_innodbcluster_field_router_container_options),
     ("bootstrapOptions",lambda: {},   on_innodbcluster_field_router_bootstrap_options),
-    ("tlsSecretName",   lambda: None, on_innodbcluster_field_router_tls_secret_name)
+    ("tlsSecretName",   lambda: None, on_innodbcluster_field_router_tls_secret_name),
+    ("podSpec",         lambda: {},   on_innodbcluster_field_router_podSpec)
 ]
 
 def handle_fields(old, new, body: Body,
