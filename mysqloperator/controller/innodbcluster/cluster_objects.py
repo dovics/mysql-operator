@@ -5,6 +5,7 @@
 
 import random
 import string
+import time
 from logging import Logger, getLogger
 import kopf
 from typing import List, Dict, Optional, cast
@@ -1801,3 +1802,226 @@ class InnoDBClusterObjectModifier:
               if len(self.router_deploy_patch) and (deploy:= self.cluster.get_router_deployment()):
                   self.logger.info(f"Patching Deployment with {self.router_deploy_patch}")
                   router_objects.update_deployment_spec(deploy, self.router_deploy_patch)
+
+
+def parse_storage_size(size_str: str) -> int:
+    """
+    Convert storage size string (e.g., '100Gi', '500M') to bytes.
+
+    Args:
+        size_str: Storage size string like '100Gi', '500Mi', '1Gi', etc.
+
+    Returns:
+        Size in bytes as integer
+    """
+    if not size_str:
+        return 0
+
+    size_str = size_str.strip().upper()
+
+    # Handle binary prefixes (Gi, Mi, Ki) - powers of 1024
+    if size_str.endswith('GI'):
+        return int(size_str[:-2]) * 1024**3
+    elif size_str.endswith('MI'):
+        return int(size_str[:-2]) * 1024**2
+    elif size_str.endswith('KI'):
+        return int(size_str[:-2]) * 1024
+    elif size_str.endswith('G'):  # Gi without the 'i'
+        return int(size_str[:-1]) * 1024**3
+    elif size_str.endswith('M'):  # Mi without the 'i'
+        return int(size_str[:-1]) * 1024**2
+    elif size_str.endswith('K'):  # Ki without the 'i'
+        return int(size_str[:-1]) * 1024
+    else:
+        # Assume bytes if no unit
+        try:
+            return int(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid storage size format: {size_str}")
+
+
+def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str,
+                                          namespace: str, target_size: str,
+                                          logger: Logger) -> None:
+    """
+    Delete and recreate a StatefulSet with updated storage size in volumeClaimTemplate.
+
+    This function handles the StatefulSet recreation process:
+    1. Delete StatefulSet with Orphan propagation (keeps PVCs and Pods)
+    2. Wait for StatefulSet to be fully deleted
+    3. Recreate StatefulSet with new volumeClaimTemplate
+
+    Args:
+        cluster: InnoDBCluster instance
+        sts_name: Name of the StatefulSet to recreate
+        namespace: Namespace of the StatefulSet
+        target_size: Target storage size (e.g., '200Gi')
+        logger: Logger instance
+
+    Raises:
+        Exception: If StatefulSet deletion or recreation fails
+    """
+    from kubernetes.client import V1DeleteOptions
+
+    # Step 1: Delete StatefulSet with Orphan propagation
+    logger.info(f"Deleting StatefulSet {sts_name} with Orphan propagation")
+
+    delete_options = V1DeleteOptions(
+        grace_period_seconds=0,
+        propagation_policy='Orphan'  # Don't delete PVCs and Pods
+    )
+
+    try:
+        api_apps.delete_namespaced_stateful_set(
+            sts_name,
+            namespace,
+            body=delete_options
+        )
+        logger.info(f"Successfully deleted StatefulSet {sts_name}")
+    except Exception as exc:
+        logger.error(f"Failed to delete StatefulSet {sts_name}: {exc}")
+        raise
+
+    # Step 2: Wait for StatefulSet to be fully deleted
+    logger.info(f"Waiting for StatefulSet {sts_name} to be fully deleted")
+
+    max_wait_seconds = 60
+    wait_interval_seconds = 2
+    waited_seconds = 0
+
+    while waited_seconds < max_wait_seconds:
+        try:
+            api_apps.read_namespaced_stateful_set(sts_name, namespace)
+            logger.info(f"StatefulSet {sts_name} still exists, waiting... ({waited_seconds}/{max_wait_seconds}s)")
+            time.sleep(wait_interval_seconds)
+            waited_seconds += wait_interval_seconds
+        except Exception as exc:
+            # 404 means it's gone, which is what we want
+            if hasattr(exc, 'status') and exc.status == 404:
+                logger.info(f"StatefulSet {sts_name} fully deleted")
+                break
+            # Some other error
+            logger.error(f"Unexpected error checking StatefulSet {sts_name}: {exc}")
+            raise
+
+    if waited_seconds >= max_wait_seconds:
+        raise Exception(f"Timeout waiting for StatefulSet {sts_name} to be deleted after {max_wait_seconds}s")
+
+    # Step 3: Recreate the StatefulSet with new volumeClaimTemplate
+    logger.info(f"Recreating StatefulSet with new volumeClaimTemplate (storage={target_size})")
+
+    try:
+        import kopf
+        # Prepare the new StatefulSet with the updated storage size
+        icspec = cluster.parsed_spec
+        statefulset = prepare_cluster_stateful_set(cluster, icspec, logger)
+        logger.info(f"Prepared new StatefulSet {sts_name} with storage={target_size}")
+
+        # Adopt the StatefulSet to link it to the InnoDBCluster
+        kopf.adopt(statefulset)
+        logger.info(f"Adopted new StatefulSet {sts_name}")
+
+        # Create the StatefulSet
+        api_apps.create_namespaced_stateful_set(
+            namespace=namespace,
+            body=statefulset
+        )
+        logger.info(f"Successfully created StatefulSet {sts_name} with new volumeClaimTemplate")
+    except Exception as exc:
+        logger.error(f"Failed to recreate StatefulSet {sts_name}: {exc}")
+        logger.error("Manual intervention required: StatefulSet was deleted but could not be recreated")
+        raise
+
+
+def expand_pvcs_and_recreate_sts(cluster: InnoDBCluster, target_size: str, logger: Logger) -> None:
+    """
+    Expand existing PVCs and recreate StatefulSet with new volumeClaimTemplate.
+
+    This function handles the PVC expansion process when the datadirVolumeClaimTemplate
+    size is changed in the InnoDBCluster spec.
+
+    Process:
+    1. Expand all existing PVCs to target_size
+    2. Delete and recreate StatefulSet with new volumeClaimTemplate
+
+    Args:
+        cluster: InnoDBCluster instance
+        target_size: Target storage size (e.g., '200Gi')
+        logger: Logger instance
+
+    Raises:
+        Exception: If PVC expansion or StatefulSet recreation fails
+    """
+    sts = cluster.get_stateful_set()
+    if not sts:
+        logger.warning("StatefulSet not found, cannot expand PVCs")
+        return
+
+    sts_name = sts.metadata.name
+    namespace = sts.metadata.namespace
+
+    logger.info(f"Starting PVC expansion for {cluster.name} to {target_size}")
+
+    # Step 1: Expand all existing PVCs
+    logger.info(f"Step 1: Expanding existing PVCs to {target_size}")
+
+    # Get all PVCs for this cluster using the cluster's label selector
+    label_selector = f"mysql.oracle.com/cluster={cluster.name},component=mysqld"
+
+    try:
+        pvcs = api_core.list_namespaced_persistent_volume_claim(
+            namespace,
+            label_selector=label_selector
+        )
+    except Exception as exc:
+        logger.error(f"Failed to list PVCs: {exc}")
+        raise
+
+    target_size_bytes = parse_storage_size(target_size)
+    expanded_count = 0
+    skipped_count = 0
+
+    for pvc in pvcs.items:
+        # storage can be accessed as attribute or dict key depending on the API response
+        requests = pvc.spec.resources.requests
+        current_size = str(requests['storage'] if isinstance(requests, dict) else requests.storage)
+        current_size_bytes = parse_storage_size(current_size)
+
+        # Skip PVCs that are already at or above target size
+        if current_size_bytes >= target_size_bytes:
+            logger.info(f"PVC {pvc.metadata.name} already at {current_size}, skipping")
+            skipped_count += 1
+            continue
+
+        logger.info(f"Expanding PVC {pvc.metadata.name} from {current_size} to {target_size}")
+
+        # Patch PVC to expand it
+        patch = {
+            "spec": {
+                "resources": {
+                    "requests": {
+                        "storage": target_size
+                    }
+                }
+            }
+        }
+
+        try:
+            api_core.patch_namespaced_persistent_volume_claim(
+                pvc.metadata.name,
+                namespace,
+                patch
+            )
+            logger.info(f"Successfully expanded PVC {pvc.metadata.name}")
+            expanded_count += 1
+        except Exception as exc:
+            logger.error(f"Failed to expand PVC {pvc.metadata.name}: {exc}")
+            raise
+
+    logger.info(f"Step 1 complete: Expanded {expanded_count} PVCs, skipped {skipped_count} PVCs")
+
+    # Step 2: Delete and recreate StatefulSet with new volumeClaimTemplate
+    logger.info(f"Step 2: Recreating StatefulSet with new storage size")
+    recreate_stateful_set_with_new_storage(cluster, sts_name, namespace, target_size, logger)
+
+    logger.info(f"PVC expansion process completed successfully for {cluster.name}")

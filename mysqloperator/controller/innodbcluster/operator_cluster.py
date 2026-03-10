@@ -462,9 +462,11 @@ def on_innodbcluster_delete(name: str, namespace: str, body: Body,
                                             logger.info(f"Removing INVALIDATED and UNREACHABLE cluster {cluster_name} from the cluster")
                                             cs.remove_cluster(cluster_name, {"force": True})
                                     else:
-                                        logger.info(f"Removing cluster {my_name} from the clusterset and dissolving the clusterset {cs}")
-                                        cs.dissolve({'force': True})
-                                        logger.info(f"Removed cluster {my_name} from the clusterset and the dissolved the clusterset")
+                                        logger.info(f"Removing cluster {my_name} from the clusterset (the only cluster)")
+                                        # ClusterSet doesn't have a dissolve() method.
+                                        # When the last cluster is removed, the ClusterSet will be automatically removed.
+                                        cs.remove_cluster(my_name, {"force": True})
+                                        logger.info(f"Removed cluster {my_name} from the clusterset. ClusterSet will be automatically removed.")
                                 else:
                                     cs.remove_cluster(my_name, {"force": True})
                             else:
@@ -1027,6 +1029,98 @@ def on_innodbcluster_field_keyring(old: str, new: str, body: Body,
     cluster_objects.update_objects_for_keyring(cluster, patcher, logger)
 
 
+def on_innodbcluster_field_datadir_volume_claim_template(
+    old: dict, new: dict, body: Body,
+    cluster: InnoDBCluster,
+    patcher: cluster_objects.InnoDBClusterObjectModifier,
+    logger: Logger
+) -> None:
+    """
+    Handle changes to datadirVolumeClaimTemplate.
+
+    When the PVC template size changes:
+    1. Expand all existing PVCs to the new size
+    2. Recreate StatefulSet with the new template using Orphan propagation
+
+    This ensures that both existing and new pods will have PVCs with the
+    same size, avoiding inconsistency when scaling up after PVC expansion.
+
+    Args:
+        old: Old datadirVolumeClaimTemplate dict
+        new: New datadirVolumeClaimTemplate dict
+        body: InnoDBCluster resource body
+        cluster: InnoDBCluster instance
+        patcher: InnoDBClusterObjectModifier instance
+        logger: Logger instance
+
+    Raises:
+        kopf.TemporaryError: If cluster is not ready
+        kopf.PermanentError: If trying to reduce PVC size (not supported)
+        Exception: If PVC expansion or StatefulSet recreation fails
+    """
+    # Extract storage size from old and new templates
+    old_size = old.get('resources', {}).get('requests', {}).get('storage') if old else None
+    new_size = new.get('resources', {}).get('requests', {}).get('storage') if new else None
+
+    if not old_size or not new_size:
+        logger.warning("Could not determine storage size from PVC template")
+        logger.warning(f"old_size={old_size}, new_size={new_size}")
+        return
+
+    if old_size == new_size:
+        logger.info("datadirVolumeClaimTemplate storage size unchanged, no action needed")
+        # Check if other fields changed (e.g., storageClassName, accessModes)
+        if old != new:
+            logger.warning(f"datadirVolumeClaimTemplate changed but storage size is the same. "
+                          f"Change detected: old={old}, new={new}")
+            logger.warning("Only storage size changes are currently supported")
+        return
+
+    logger.info(f"datadirVolumeClaimTemplate storage size changed from {old_size} to {new_size}")
+    cluster.info(
+        action="ExpandPVC",
+        reason="PVCTemplateChanged",
+        message=f"Expanding PVCs from {old_size} to {new_size} and recreating StatefulSet"
+    )
+
+    # Validate that we're only increasing the size (PVCs cannot be shrunk)
+    old_size_bytes = cluster_objects.parse_storage_size(old_size)
+    new_size_bytes = cluster_objects.parse_storage_size(new_size)
+
+    if new_size_bytes < old_size_bytes:
+        error_msg = (f"Cannot reduce PVC size from {old_size} to {new_size}. "
+                     f"PVC expansion is one-way only. You can expand but not shrink PVCs.")
+        logger.error(error_msg)
+        raise kopf.PermanentError(error_msg)
+
+    # Check if cluster is ready for this operation
+    if not cluster.ready:
+        logger.info("Cluster not ready for PVC expansion. Waiting...")
+        raise kopf.TemporaryError(
+            "Cluster not ready for PVC expansion. Waiting for cluster to be ready...",
+            delay=30
+        )
+
+    # Verify StatefulSet exists
+    if not cluster.get_stateful_set():
+        logger.warning("StatefulSet does not exist yet. This is normal during cluster creation.")
+        raise kopf.TemporaryError("StatefulSet not ready", delay=30)
+
+    # Perform the expansion and StatefulSet recreation
+    logger.info(f"Starting PVC expansion process for cluster {cluster.name}")
+    try:
+        cluster_objects.expand_pvcs_and_recreate_sts(cluster, new_size, logger)
+        logger.info(f"PVC expansion completed successfully for cluster {cluster.name}")
+    except Exception as exc:
+        logger.error(f"PVC expansion failed for cluster {cluster.name}: {exc}")
+        cluster.warn(
+            action="ExpandPVC",
+            reason="ExpansionFailed",
+            message=f"Failed to expand PVCs: {exc}"
+        )
+        raise
+
+
 def call_kopf_style_on_handler_if_needed(old_dict: dict, new_dict: dict, key: str, body: Body,
                                         cluster: InnoDBCluster,
                                         patcher: cluster_objects.InnoDBClusterObjectModifier,
@@ -1068,7 +1162,8 @@ spec_tld_handlers : OnFieldHandlerList = [\
     ("tlsCASecretName",lambda: None, on_innodbcluster_field_tls_ca_secret_name),
     ("logs",           lambda: {},   on_innodbcluster_field_logs),
     ("metrics",        lambda: {},   on_innodbcluster_field_metrics),
-    ("keyring",        lambda: {},   on_innodbcluster_field_keyring)
+    ("keyring",        lambda: {},   on_innodbcluster_field_keyring),
+    ("datadirVolumeClaimTemplate", lambda: {}, on_innodbcluster_field_datadir_volume_claim_template)
 ]
 
 spec_router_handlers : OnFieldHandlerList = [\
