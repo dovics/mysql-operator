@@ -3,3 +3,4 @@ __pycache__
 .vscode
 /Dockerfile
 Python-3.13.9.tgz
+mysql-operator-2.2.7.tgz

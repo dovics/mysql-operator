@@ -10,7 +10,7 @@ import os
 from importlib.metadata import distributions
 
 debug = False
-#enable_mysqld_general_log = False
+# enable_mysqld_general_log = False
 
 _pull_policy = os.getenv("MYSQL_OPERATOR_IMAGE_PULL_POLICY")
 if _pull_policy:
@@ -26,7 +26,7 @@ else:
 
 # Constants
 OPERATOR_VERSION = "2.2.7"
-OPERATOR_EDITION_NAME_TO_ENUM = { edition.value : edition.name for edition in Edition }
+OPERATOR_EDITION_NAME_TO_ENUM = {edition.value: edition.name for edition in Edition}
 
 DEFAULT_VERSION_TAG = "9.6.0"
 
@@ -46,10 +46,13 @@ DISABLED_MYSQL_VERSION = {
 DEFAULT_ROUTER_VERSION_TAG = DEFAULT_VERSION_TAG
 
 # This is used for the sidecar. The operator version is deploy-operator.yaml
-DEFAULT_OPERATOR_VERSION_TAG = f"{DEFAULT_VERSION_TAG}-{OPERATOR_VERSION}"
+DEFAULT_OPERATOR_VERSION_TAG = os.getenv(
+    "MYSQL_OPERATOR_DEFAULT_VERSION_TAG", f"{DEFAULT_VERSION_TAG}-{OPERATOR_VERSION}"
+)
 
 DEFAULT_IMAGE_REPOSITORY = os.getenv(
-    "MYSQL_OPERATOR_DEFAULT_REPOSITORY", default="container-registry.oracle.com/mysql").rstrip('/')
+    "MYSQL_OPERATOR_DEFAULT_REPOSITORY", default="container-registry.oracle.com/mysql"
+).rstrip("/")
 
 MYSQL_SERVER_IMAGE = "community-server"
 MYSQL_ROUTER_IMAGE = "community-router"
@@ -63,6 +66,7 @@ CLUSTER_ADMIN_USER_NAME = "mysqladmin"
 ROUTER_METADATA_USER_NAME = "mysqlrouter"
 BACKUP_USER_NAME = "mysqlbackup"
 
+
 def log_config_banner(logger) -> None:
     logger.info(f"KUBERNETES_VERSION ={k8s_version()}")
     logger.info(f"OPERATOR_VERSION   ={OPERATOR_VERSION}")
@@ -73,15 +77,16 @@ def log_config_banner(logger) -> None:
     logger.info(f"SIDECAR_VERSION_TAG={DEFAULT_OPERATOR_VERSION_TAG}")
     logger.info(f"DEFAULT_IMAGE_REPOSITORY   ={DEFAULT_IMAGE_REPOSITORY}")
     for dist in distributions():
-        name = dist.metadata['Name']
+        name = dist.metadata["Name"]
         version = dist.version
         logger.info(f"{name:23}={version:10}")
+
 
 def config_from_env() -> None:
     import mysqlsh
 
     global debug
-#    global enable_mysqld_general_log
+    #    global enable_mysqld_general_log
     global default_image_pull_policy
 
     level = os.getenv("MYSQL_OPERATOR_DEBUG")
@@ -90,7 +95,7 @@ def config_from_env() -> None:
         level = int(level)
         if level > 0:
             debug = level
-#            enable_mysqld_general_log = True
+            #            enable_mysqld_general_log = True
 
             if level > 4:
                 mysqlsh.globals.shell.options.logLevel = 8

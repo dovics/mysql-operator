@@ -21,7 +21,7 @@ PYTHON_VERSION="3.13.9"
 PYTHON_TARBALL="Python-${PYTHON_VERSION}.tgz"
 PYTHON_DOWNLOAD_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_TARBALL}"
 PYTHON_DEPS_IMAGE="mysql-operator-python-deps:${PYTHON_VERSION}-amd64"
-OPERATOR_IMAGE_TAG=${OPERATOR_IMAGE_TAG:-"mysql/mysql-operator"}
+OPERATOR_IMAGE_TAG=${OPERATOR_IMAGE_TAG:-"mysql/community-operator"}
 BUILD_DIR="/tmp/mysql-operator-build"
 CURRENT_DIR="$(pwd)"
 
@@ -203,7 +203,8 @@ build_operator_image() {
                     --build-arg "https_proxy=${https_proxy:-}" \
                     --build-arg "no_proxy=${no_proxy:-}" \
                     -f Dockerfile \
-                    -t "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64" .; then
+                    -t "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64" \
+                    -t "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}" .; then
         print_success "Operator image built successfully"
     else
         print_error "Failed to build operator image"
@@ -237,6 +238,14 @@ echo "✓ Python: $(python3 -c "import sys; print(f\"{sys.version_info.major}.{s
 echo "✓ MySQL Shell: $(mysqlsh --version | grep -oP \"Ver \K[0-9.]+\")"
 echo "✓ Operator code: $(ls /usr/lib/mysqlsh/python-packages/mysqloperator/ | wc -l) files"
 '
+    print_success "Operator image (amd64) verified"
+
+    print_step "Verifying ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}"
+    docker run --rm "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}" sh -c '
+echo "✓ Python: $(python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\")")"
+echo "✓ MySQL Shell: $(mysqlsh --version | grep -oP \"Ver \K[0-9.]+\")"
+echo "✓ Operator code: $(ls /usr/lib/mysqlsh/python-packages/mysqloperator/ | wc -l) files"
+'
     print_success "Operator image verified"
 }
 
@@ -264,16 +273,11 @@ show_summary() {
     echo "Built Images:"
     echo "  • ${PYTHON_DEPS_IMAGE}"
     echo "  • ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64"
-    echo ""
-
-    echo "Image Sizes:"
-    docker images | grep -E "mysql-operator|REPOSITORY" | while read line; do
-        echo "  $line"
-    done
+    echo "  • ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}"
     echo ""
 
     echo "Next Steps:"
-    echo "  1. Test the operator: docker run --rm ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64 python3 --version"
+    echo "  1. Test the operator: docker run --rm ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG} python3 --version"
     echo "  2. Deploy to Kubernetes: kubectl apply -f deploy/deploy-crds.yaml"
     echo "  3. Deploy operator: kubectl apply -f deploy/deploy-operator.yaml"
     echo ""

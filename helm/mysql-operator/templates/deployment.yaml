@@ -63,6 +63,10 @@ spec:
           - name: MYSQL_OPERATOR_K8S_CLUSTER_DOMAIN
             value: {{ .Values.envs.k8sClusterDomain }}
           {{- end }}
+          {{- if (((.Values).envs).imagesDefaultVersion) }}
+          - name: MYSQL_OPERATOR_DEFAULT_VERSION_TAG
+            value: {{ .Values.envs.imagesDefaultVersion }}
+          {{- end }}
           readinessProbe:
             exec:
               command:

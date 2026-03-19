@@ -406,6 +406,37 @@ def get_root_account_info(cluster: InnoDBCluster) -> Tuple[str, str, str]:
         f"Could not get secret '{cluster.parsed_spec.secretName}' with for root account information for {cluster.namespace}/{cluster.name}")
 
 
+def get_custom_user_info(cluster: InnoDBCluster) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    """
+    Get custom user and database info from the user secret.
+    Returns Tuple of (user, host, password, database) if customUser and customPassword are configured.
+    database can be None if customDatabase is not set.
+    """
+    secrets = cluster.get_user_secrets()
+    if not secrets:
+        return None
+
+    user = secrets.data.get("customUser")
+    if not user:
+        return None
+
+    host = secrets.data.get("customHost")
+    password = secrets.data.get("customPassword")
+
+    if not password:
+        return None
+
+    user = utils.b64decode(user)
+    host = utils.b64decode(host) if host else "%"
+    password = utils.b64decode(password)
+
+    database = secrets.data.get("customDatabase")
+    if database:
+        database = utils.b64decode(database)
+
+    return user, host, password, database
+
+
 def create_root_account(session: 'ClassicSession', pod: MySQLPod, cluster: InnoDBCluster, logger: Logger) -> None:
     """
     Create general purpose root account (owned by user) as specified by user.
@@ -436,6 +467,34 @@ def create_root_account(session: 'ClassicSession', pod: MySQLPod, cluster: InnoD
     ret = session.run_sql("GRANT PROXY ON ''@'' TO ?@? WITH GRANT OPTION", [user, host])
     logger.info(f"GRANT PROXY - Warnings {ret.warnings if ret is not None else []}")
 
+
+def create_custom_account(session: 'ClassicSession', cluster: InnoDBCluster, logger: Logger) -> None:
+    """
+    Create custom database and user with privileges as specified in the user secret.
+    """
+    custom_info = get_custom_user_info(cluster)
+    if not custom_info:
+        logger.info("No custom user configuration found, skipping")
+        return
+
+    user, host, password, database = custom_info
+
+    logger.info(f"Creating custom user {user}@{host}")
+
+    # Create the user
+    ret = session.run_sql("CREATE USER IF NOT EXISTS ?@? IDENTIFIED BY ?", [user, host, password])
+    logger.info(f"CREATE USER - Warnings {ret.warnings if ret is not None else []}")
+
+    # If database is specified, create the database and grant privileges
+    if database:
+        logger.info(f"Creating custom database '{database}'")
+        ret = session.run_sql(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+        logger.info(f"CREATE DATABASE - Warnings {ret.warnings if ret is not None else []}")
+
+    ret = session.run_sql("GRANT CREATE, SELECT, INSERT, UPDATE, DELETE, ALTER, DROP ON *.* TO ?@?", [user, host])
+    logger.info(f"GRANT privileges - Warnings {ret.warnings if ret is not None else []}")
+
+    logger.info(f"Custom user {user}@{host} created with access to database {database}")
 
 
 def create_admin_account(session, cluster, logger: Logger):
@@ -515,6 +574,7 @@ def initialize(session: 'ClassicSession', datadir: str, pod: MySQLPod, cluster: 
     session.run_sql("SET sql_log_bin=0")
     create_root_account(session, pod, cluster, logger)
     create_admin_account(session, cluster, logger)
+    create_custom_account(session, cluster, logger)
     session.run_sql("SET sql_log_bin=1")
 
     user, password = cluster.get_admin_account()

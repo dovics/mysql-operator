@@ -13,6 +13,7 @@ envs:
     imagesPullPolicy: IfNotPresent
     imagesDefaultRegistry:
     imagesDefaultRepository:
+    imagesDefaultVersion:
     k8sClusterDomain:
 
 replicas: 1
