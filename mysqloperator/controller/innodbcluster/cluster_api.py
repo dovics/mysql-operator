@@ -1961,6 +1961,11 @@ class AbstractServerSetSpec(abc.ABC):
         if section in spec_root:
             self.instanceService.parse(dget_dict(spec_root, section, "spec"), f"spec.{section}")
 
+        # Whether to reuse PVC when pod is deleted. If false, PVC is automatically deleted
+        # and will be recreated on the new node when pod is rescheduled. This is useful
+        # for local storage where PV is bound to a specific node.
+        self.reusePVC = dget_bool(spec_root, "reusePVC", "spec", default_value=True)
+
 
     def print_backup_schedules(self) -> None:
         for schedule in self.backupSchedules:

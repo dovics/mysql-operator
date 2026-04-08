@@ -442,6 +442,10 @@ spec:
                       type: object
                       description: "Custom labels for the Service"
                       x-kubernetes-preserve-unknown-fields: true
+                reusePVC:
+                  type: boolean
+                  default: true
+                  description: "Whether to reuse PVC when pod is deleted. If false, PVC is automatically deleted and will be recreated on the new node when pod is rescheduled. This is useful for local storage where PV is bound to a specific node."
                 service:
                   type: object
                   description: "Configuration of the Service used by applications connecting to the InnoDB Cluster"

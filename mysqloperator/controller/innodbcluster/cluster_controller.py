@@ -6,10 +6,12 @@
 from kopf._cogs.structs.bodies import Body
 from .. import consts, errors, shellutils, utils, config, mysqlutils
 from .. import diagnose
+from ..kubeutils import api_core, ApiException
 from ..backup import backup_objects
 from ..shellutils import DbaWrap
 from . import cluster_objects, router_objects
-from .cluster_api import MySQLPod, InnoDBCluster, client
+from .cluster_api import MySQLPod, InnoDBCluster
+from kubernetes.client import V1DeleteOptions
 import typing
 from typing import Optional, TYPE_CHECKING, Dict, cast, Callable, Union
 from logging import Logger
@@ -975,6 +977,35 @@ class ClusterController:
             # Retry from scratch in another iteration
             logger.info("on_pod_deleted: RETRYING ON POD DELETE")
             raise kopf.TemporaryError(f"Cluster repair from state {diag.status} attempted", delay=3)
+
+        # Auto-delete PVC if reusePVC is false
+        if not self.cluster.parsed_spec.reusePVC:
+            current_pods = self.cluster.get_pods()
+            # Protection: if only one pod remains, don't delete PVC to avoid complete data loss
+            if len(current_pods) <= 1:
+                logger.info(
+                    f"on_pod_deleted: Only {len(current_pods)} pod(s) remaining in cluster, "
+                    f"skipping PVC deletion to prevent data loss"
+                )
+            else:
+                pvc_name = f"datadir-{pod.name}"
+                pvc_namespace = self.cluster.namespace
+                logger.info(f"on_pod_deleted: reusePVC is false, deleting PVC {pvc_namespace}/{pvc_name}")
+                try:
+                    delete_options = V1DeleteOptions(grace_period_seconds=0)
+                    api_core.delete_namespaced_persistent_volume_claim(
+                        pvc_name,
+                        pvc_namespace,
+                        body=delete_options
+                    )
+                    logger.info(f"on_pod_deleted: Successfully deleted PVC {pvc_namespace}/{pvc_name}")
+                except ApiException as e:
+                    if e.status == 404:
+                        logger.info(f"on_pod_deleted: PVC {pvc_namespace}/{pvc_name} already deleted, ignoring")
+                    else:
+                        logger.error(f"on_pod_deleted: Failed to delete PVC {pvc_namespace}/{pvc_name}: {e}")
+                        # Don't fail the whole deletion, PVC deletion is best effort
+                        pass
 
         # TODO maybe not needed? need to make sure that shrinking cluster will be reported as ONLINE
         self.probe_status(logger)
