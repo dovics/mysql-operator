@@ -322,14 +322,15 @@ class MetriscSpec:
         self.dbuser_max_connections = dget_int(user_spec, "maxConnections",
                                                user_prefix, default_value=3)
 
-        self.options.append("--config.my-cnf=/tmp/metrics/metrics.cnf") # see __init__
+        if "--config.my-cnf=/tmp/metrics/metrics.cnf" not in self.options:
+            self.options.append("--config.my-cnf=/tmp/metrics/metrics.cnf") # see __init__
 
     def validate(self) -> None:
         pass
 
     def _add_container_to_sts_spec(self, sts: Union[dict, api_client.V1StatefulSet], patcher: 'InnoDBClusterObjectModifier', add: bool, logger: Logger) -> None:
         options = self.options
-        if self.web_config:
+        if self.web_config and "--web.config.file=/config/web.config" not in options:
             options += ["--web.config.file=/config/web.config"]
 
         mounts = [
