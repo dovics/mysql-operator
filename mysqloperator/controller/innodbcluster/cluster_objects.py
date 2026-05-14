@@ -468,6 +468,7 @@ spec:
         fsGroup: 27
 {utils.indent("fsGroupChangePolicy: " + spec.dataDirPermissions.fsGroupChangePolicy, 8) if spec.dataDirPermissions.fsGroupChangePolicy else ""}
         runAsNonRoot: true
+      shareProcessNamespace: true
       terminationGracePeriodSeconds: 120
       initContainers:
 {utils.indent(fixdatadir_container, 6)}
