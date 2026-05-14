@@ -1,0 +1,34 @@
+# Copyright (c) 2025, Oracle and/or its affiliates.
+#
+# Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl/
+#
+
+FROM golang:1.26.2 AS builder
+
+# Build the restore binary
+WORKDIR /build
+COPY cmd/restore/go.mod ./go.mod
+COPY cmd/restore/go.sum ./go.sum
+COPY cmd/restore/*.go ./
+RUN go env -w GOPROXY=https://goproxy.cn,direct \
+    && CGO_ENABLED=0 GOOS=linux go build -o /opt/restore .
+
+FROM %%MYSQL_OPERATOR_PYTHON_DEPS%%
+
+# Install MySQL Shell
+RUN rpm -U %%MYSQL_REPO_URL%%/%%MYSQL_CONFIG_PKG%%-el9.rpm \
+  && microdnf update && echo "[main]" > /etc/dnf/dnf.conf \
+  && microdnf install --enablerepo=%%MYSQL_SHELL_REPO%% -y glibc-langpack-en openssl mysql-shell-%%MYSQL_SHELL_VERSION%% \
+  && microdnf remove -y %%MYSQL_CONFIG_PKG%% \
+  && microdnf clean all
+
+RUN groupadd -g27 mysql && useradd -u27 -g27 mysql
+
+RUN mkdir /mysqlsh && chown 2 /mysqlsh
+
+# Copy the restore binary
+COPY --from=builder /opt/restore /opt/restore
+
+USER 2
+
+ENV HOME=/mysqlsh
