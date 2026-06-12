@@ -2857,8 +2857,12 @@ class InnoDBCluster(K8sInterfaceObject):
     def _remove_finalizer(self, fin: str) -> None:
         # TODO strategic merge patch not working here??
         #patch = { "metadata": { "$deleteFromPrimitiveList/finalizers": [fin] }}
+        finalizers = self.metadata.get("finalizers") or []
+        if fin not in finalizers:
+            return
+
         patch = {"metadata": {"finalizers": [
-            f for f in self.metadata["finalizers"] if f != fin]}}
+            f for f in finalizers if f != fin]}}
 
         self.obj = self._patch(self.namespace, self.name, patch)
 

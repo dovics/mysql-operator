@@ -1502,9 +1502,8 @@ def remove_read_replica(cluster: InnoDBCluster, rr: ReadReplicaSpec):
 
 
 def on_first_cluster_pod_created(cluster: InnoDBCluster, logger: Logger) -> None:
-    # Add finalizer to the cluster object to prevent it from being deleted
-    # until the last pod is properly deleted.
-    cluster.add_cluster_finalizer()
+    # Do not add a cluster finalizer; deletions should not be blocked by the operator.
+    pass
 
 
 def on_last_cluster_pod_removed(cluster: InnoDBCluster, logger: Logger) -> None:

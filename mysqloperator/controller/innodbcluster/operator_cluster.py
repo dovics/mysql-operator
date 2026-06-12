@@ -372,7 +372,8 @@ def on_innodbcluster_create(name: str, namespace: Optional[str], body: Body, pat
 
 
 @kopf.on.delete(consts.GROUP, consts.VERSION,
-                consts.INNODBCLUSTER_PLURAL)  # type: ignore
+                consts.INNODBCLUSTER_PLURAL,
+                optional=True)  # type: ignore
 def on_innodbcluster_delete(name: str, namespace: str, body: Body,
                             logger: Logger, **kwargs):
     cluster = InnoDBCluster(body)
@@ -911,7 +912,8 @@ def on_pod_event(body: Body, logger: Logger, **kwargs):
 
 
 @kopf.on.delete("", "v1", "pods",
-                labels={"component": "mysqld"})  # type: ignore
+                labels={"component": "mysqld"},
+                optional=True)  # type: ignore
 def on_pod_delete(body: Body, logger: Logger, **kwargs):
     """
     Handle MySQL server Pod deletion, which can happen when:
@@ -1318,7 +1320,8 @@ def on_failover_create(name: str, namespace: Optional[str], body: Body,
 
 
 @kopf.on.delete("", "v1", "pods",
-                labels={"component": "mysqlrouter"})  # type: ignore
+                labels={"component": "mysqlrouter"},
+                optional=True)  # type: ignore
 def on_router_pod_delete(body: Body, logger: Logger, namespace: str, **kwargs):
     logger.info("on_router_pod_delete")
     router_name = body["metadata"]["name"]
