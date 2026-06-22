@@ -650,18 +650,36 @@ class ClusterController:
         except  (mysqlsh.Error, RuntimeError) as e:
             logger.warning(f"add_instance failed: error={e}")
 
-            # Incremetnal may fail if transactions are missing from binlog
-            # retry using clone
-            add_options["recoveryMethod"] = "clone"
-            logger.warning(f"trying add_instance with clone")
-            try:
-                if pod.instance_type == "read-replica":
-                    self.dba_cluster.add_replica_instance(pod.endpoint, add_options)
-                else:
-                    self.dba_cluster.add_instance(pod.endpoint_co, add_options)
-            except (mysqlsh.Error, RuntimeError) as e:
-                logger.warning(f"add_instance failed second time: error={e}")
-                raise
+            err_msg = str(e)
+            # Check if this is a duplicate server_id error - if so, remove the stale
+            # metadata entry and retry with clone
+            if "server_id" in err_msg and "already" in err_msg:
+                logger.warning(f"add_instance failed due to duplicate server_id, "
+                               f"removing instance and retrying: {e}")
+                self.__remove_instance_aux(pod, logger, True)
+                add_options["recoveryMethod"] = "clone"
+                logger.warning(f"retrying add_instance with clone")
+                try:
+                    if pod.instance_type == "read-replica":
+                        self.dba_cluster.add_replica_instance(pod.endpoint, add_options)
+                    else:
+                        self.dba_cluster.add_instance(pod.endpoint_co, add_options)
+                except (mysqlsh.Error, RuntimeError) as e:
+                    logger.warning(f"add_instance failed after remove: error={e}")
+                    raise
+            else:
+                # Incremetnal may fail if transactions are missing from binlog
+                # retry using clone
+                add_options["recoveryMethod"] = "clone"
+                logger.warning(f"trying add_instance with clone")
+                try:
+                    if pod.instance_type == "read-replica":
+                        self.dba_cluster.add_replica_instance(pod.endpoint, add_options)
+                    else:
+                        self.dba_cluster.add_instance(pod.endpoint_co, add_options)
+                except (mysqlsh.Error, RuntimeError) as e:
+                    logger.warning(f"add_instance failed second time: error={e}")
+                    raise
 
         if pod.instance_type == "read-replica":
             # This is not perfect, as we don't track this further, but async
