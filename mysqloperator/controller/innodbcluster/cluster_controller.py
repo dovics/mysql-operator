@@ -651,12 +651,12 @@ class ClusterController:
             logger.warning(f"add_instance failed: error={e}")
 
             err_msg = str(e)
-            # Check if this is a duplicate server_id error - if so, remove the stale
-            # metadata entry and retry with clone
+            # Check if this is a duplicate server_id error - if so, rescan the cluster
+            # to remove stale metadata and retry with clone
             if "server_id" in err_msg and "already" in err_msg:
                 logger.warning(f"add_instance failed due to duplicate server_id, "
-                               f"removing instance and retrying: {e}")
-                self.__remove_instance_aux(pod, logger, True)
+                               f"rescanning cluster metadata: {e}")
+                self.dba_cluster.rescan()
                 add_options["recoveryMethod"] = "clone"
                 logger.warning(f"retrying add_instance with clone")
                 try:
