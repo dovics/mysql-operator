@@ -2432,7 +2432,7 @@ class InnoDBCluster(K8sInterfaceObject):
 
     def owns_pod(self, pod) -> bool:
         owner_sts = pod.owner_reference("apps/v1", "StatefulSet")
-        return owner_sts.name == self.name
+        return owner_sts is not None and owner_sts.name == self.name
 
     def get_pod(self, index) -> 'MySQLPod':
         pod = cast(api_client.V1Pod, api_core.read_namespaced_pod(
@@ -3132,7 +3132,7 @@ class MySQLPod(K8sInterfaceObject):
             self.name, self.namespace))
 
     def owner_reference(self, api_version, kind) -> typing.Optional[api_client.V1OwnerReference]:
-        for owner in self.metadata.owner_references:
+        for owner in self.metadata.owner_references or []:
             if owner.api_version == api_version and owner.kind == kind:
                 return owner
 

@@ -1840,23 +1840,23 @@ def parse_storage_size(size_str: str) -> int:
             raise ValueError(f"Invalid storage size format: {size_str}")
 
 
-def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str,
-                                          namespace: str, target_size: str,
-                                          logger: Logger) -> None:
+def recreate_stateful_set(cluster: InnoDBCluster, sts_name: str,
+                          namespace: str, logger: Logger,
+                          reason: str) -> None:
     """
-    Delete and recreate a StatefulSet with updated storage size in volumeClaimTemplate.
+    Delete and recreate a StatefulSet from the current cluster specification.
 
     This function handles the StatefulSet recreation process:
     1. Delete StatefulSet with Orphan propagation (keeps PVCs and Pods)
     2. Wait for StatefulSet to be fully deleted
-    3. Recreate StatefulSet with new volumeClaimTemplate
+    3. Recreate StatefulSet with the current volumeClaimTemplate
 
     Args:
         cluster: InnoDBCluster instance
         sts_name: Name of the StatefulSet to recreate
         namespace: Namespace of the StatefulSet
-        target_size: Target storage size (e.g., '200Gi')
         logger: Logger instance
+        reason: Human-readable reason included in log messages
 
     Raises:
         Exception: If StatefulSet deletion or recreation fails
@@ -1864,7 +1864,7 @@ def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str
     from kubernetes.client import V1DeleteOptions
 
     # Step 1: Delete StatefulSet with Orphan propagation
-    logger.info(f"Deleting StatefulSet {sts_name} with Orphan propagation")
+    logger.info(f"Deleting StatefulSet {sts_name} with Orphan propagation ({reason})")
 
     delete_options = V1DeleteOptions(
         grace_period_seconds=0,
@@ -1907,15 +1907,14 @@ def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str
     if waited_seconds >= max_wait_seconds:
         raise Exception(f"Timeout waiting for StatefulSet {sts_name} to be deleted after {max_wait_seconds}s")
 
-    # Step 3: Recreate the StatefulSet with new volumeClaimTemplate
-    logger.info(f"Recreating StatefulSet with new volumeClaimTemplate (storage={target_size})")
+    # Step 3: Recreate the StatefulSet with the current volumeClaimTemplate
+    logger.info(f"Recreating StatefulSet with current volumeClaimTemplate ({reason})")
 
     try:
-        import kopf
-        # Prepare the new StatefulSet with the updated storage size
+        # Prepare the new StatefulSet from the current custom resource spec.
         icspec = cluster.parsed_spec
         statefulset = prepare_cluster_stateful_set(cluster, icspec, logger)
-        logger.info(f"Prepared new StatefulSet {sts_name} with storage={target_size}")
+        logger.info(f"Prepared new StatefulSet {sts_name} ({reason})")
 
         # Adopt the StatefulSet to link it to the InnoDBCluster
         kopf.adopt(statefulset)
@@ -1926,11 +1925,20 @@ def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str
             namespace=namespace,
             body=statefulset
         )
-        logger.info(f"Successfully created StatefulSet {sts_name} with new volumeClaimTemplate")
+        logger.info(f"Successfully created StatefulSet {sts_name} with current volumeClaimTemplate")
     except Exception as exc:
         logger.error(f"Failed to recreate StatefulSet {sts_name}: {exc}")
         logger.error("Manual intervention required: StatefulSet was deleted but could not be recreated")
         raise
+
+
+def recreate_stateful_set_with_new_storage(cluster: InnoDBCluster, sts_name: str,
+                                           namespace: str, target_size: str,
+                                           logger: Logger) -> None:
+    """Recreate a StatefulSet after its PVCs have been expanded."""
+    recreate_stateful_set(
+        cluster, sts_name, namespace, logger,
+        reason=f"storage size changed to {target_size}")
 
 
 def expand_pvcs_and_recreate_sts(cluster: InnoDBCluster, target_size: str, logger: Logger) -> None:

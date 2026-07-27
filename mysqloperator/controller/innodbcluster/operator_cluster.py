@@ -373,7 +373,7 @@ def on_innodbcluster_create(name: str, namespace: Optional[str], body: Body, pat
 
 @kopf.on.delete(consts.GROUP, consts.VERSION,
                 consts.INNODBCLUSTER_PLURAL,
-                optional=True, eager=True)  # type: ignore
+                optional=True)  # type: ignore
 def on_innodbcluster_delete(name: str, namespace: str, body: Body,
                             logger: Logger, **kwargs):
     cluster = InnoDBCluster(body)
@@ -913,7 +913,7 @@ def on_pod_event(body: Body, logger: Logger, **kwargs):
 
 @kopf.on.delete("", "v1", "pods",
                 labels={"component": "mysqld"},
-                optional=True, eager=True)  # type: ignore
+                optional=True)  # type: ignore
 def on_pod_delete(body: Body, logger: Logger, **kwargs):
     """
     Handle MySQL server Pod deletion, which can happen when:
@@ -1040,12 +1040,12 @@ def on_innodbcluster_field_datadir_volume_claim_template(
     """
     Handle changes to datadirVolumeClaimTemplate.
 
-    When the PVC template size changes:
-    1. Expand all existing PVCs to the new size
+    When the PVC template changes:
+    1. Expand existing PVCs if the requested size increased
     2. Recreate StatefulSet with the new template using Orphan propagation
 
-    This ensures that both existing and new pods will have PVCs with the
-    same size, avoiding inconsistency when scaling up after PVC expansion.
+    Existing Pods and PVCs remain untouched during recreation. A new storage
+    class is therefore used only for PVCs created after the template change.
 
     Args:
         old: Old datadirVolumeClaimTemplate dict
@@ -1060,65 +1060,90 @@ def on_innodbcluster_field_datadir_volume_claim_template(
         kopf.PermanentError: If trying to reduce PVC size (not supported)
         Exception: If PVC expansion or StatefulSet recreation fails
     """
-    # Extract storage size from old and new templates
+    # Extract the independently supported changes from both templates.
     old_size = old.get('resources', {}).get('requests', {}).get('storage') if old else None
     new_size = new.get('resources', {}).get('requests', {}).get('storage') if new else None
+    old_storage_class = old.get('storageClassName') if old else None
+    new_storage_class = new.get('storageClassName') if new else None
+    size_changed = old_size != new_size
+    storage_class_changed = old_storage_class != new_storage_class
 
-    if not old_size or not new_size:
+    if size_changed and (not old_size or not new_size):
         logger.warning("Could not determine storage size from PVC template")
         logger.warning(f"old_size={old_size}, new_size={new_size}")
         return
 
-    if old_size == new_size:
-        logger.info("datadirVolumeClaimTemplate storage size unchanged, no action needed")
-        # Check if other fields changed (e.g., storageClassName, accessModes)
+    if not size_changed and not storage_class_changed:
+        logger.info("Supported datadirVolumeClaimTemplate fields are unchanged")
         if old != new:
-            logger.warning(f"datadirVolumeClaimTemplate changed but storage size is the same. "
-                          f"Change detected: old={old}, new={new}")
-            logger.warning("Only storage size changes are currently supported")
+            logger.warning(
+                "Ignoring unsupported datadirVolumeClaimTemplate change: old=%s, new=%s",
+                old, new)
         return
 
-    logger.info(f"datadirVolumeClaimTemplate storage size changed from {old_size} to {new_size}")
-    cluster.info(
-        action="ExpandPVC",
-        reason="PVCTemplateChanged",
-        message=f"Expanding PVCs from {old_size} to {new_size} and recreating StatefulSet"
-    )
+    if size_changed:
+        logger.info(f"datadirVolumeClaimTemplate storage size changed from {old_size} to {new_size}")
+        cluster.info(
+            action="ExpandPVC",
+            reason="PVCTemplateChanged",
+            message=f"Expanding PVCs from {old_size} to {new_size} and recreating StatefulSet"
+        )
 
-    # Validate that we're only increasing the size (PVCs cannot be shrunk)
-    old_size_bytes = cluster_objects.parse_storage_size(old_size)
-    new_size_bytes = cluster_objects.parse_storage_size(new_size)
+        # Validate that we're only increasing the size (PVCs cannot be shrunk)
+        old_size_bytes = cluster_objects.parse_storage_size(old_size)
+        new_size_bytes = cluster_objects.parse_storage_size(new_size)
 
-    if new_size_bytes < old_size_bytes:
-        error_msg = (f"Cannot reduce PVC size from {old_size} to {new_size}. "
-                     f"PVC expansion is one-way only. You can expand but not shrink PVCs.")
-        logger.error(error_msg)
-        raise kopf.PermanentError(error_msg)
+        if new_size_bytes < old_size_bytes:
+            error_msg = (f"Cannot reduce PVC size from {old_size} to {new_size}. "
+                         f"PVC expansion is one-way only. You can expand but not shrink PVCs.")
+            logger.error(error_msg)
+            raise kopf.PermanentError(error_msg)
+
+    if storage_class_changed:
+        logger.info(
+            "datadirVolumeClaimTemplate storageClassName changed from %r to %r",
+            old_storage_class, new_storage_class)
+        cluster.info(
+            action="RecreateStatefulSet",
+            reason="StorageClassChanged",
+            message=(f"Recreating StatefulSet with storageClassName "
+                     f"{new_storage_class!r}; existing Pods and PVCs are preserved")
+        )
 
     # Check if cluster is ready for this operation
     if not cluster.ready:
-        logger.info("Cluster not ready for PVC expansion. Waiting...")
+        logger.info("Cluster not ready for PVC template update. Waiting...")
         raise kopf.TemporaryError(
-            "Cluster not ready for PVC expansion. Waiting for cluster to be ready...",
+            "Cluster not ready for PVC template update. Waiting for cluster to be ready...",
             delay=30
         )
 
     # Verify StatefulSet exists
-    if not cluster.get_stateful_set():
+    if not (sts := cluster.get_stateful_set()):
         logger.warning("StatefulSet does not exist yet. This is normal during cluster creation.")
         raise kopf.TemporaryError("StatefulSet not ready", delay=30)
 
     # Perform the expansion and StatefulSet recreation
-    logger.info(f"Starting PVC expansion process for cluster {cluster.name}")
     try:
-        cluster_objects.expand_pvcs_and_recreate_sts(cluster, new_size, logger)
-        logger.info(f"PVC expansion completed successfully for cluster {cluster.name}")
+        if size_changed:
+            # This also recreates the STS, using the current spec. If the storage
+            # class changed in the same update, it is applied by that recreation.
+            logger.info(f"Starting PVC expansion process for cluster {cluster.name}")
+            cluster_objects.expand_pvcs_and_recreate_sts(cluster, new_size, logger)
+            logger.info(f"PVC expansion completed successfully for cluster {cluster.name}")
+        else:
+            cluster_objects.recreate_stateful_set(
+                cluster, sts.metadata.name, sts.metadata.namespace, logger,
+                reason=(f"storageClassName changed from {old_storage_class!r} "
+                        f"to {new_storage_class!r}"))
+            logger.info(
+                "StatefulSet recreated for storageClassName change; existing Pods and PVCs were preserved")
     except Exception as exc:
-        logger.error(f"PVC expansion failed for cluster {cluster.name}: {exc}")
+        logger.error(f"PVC template update failed for cluster {cluster.name}: {exc}")
         cluster.warn(
-            action="ExpandPVC",
-            reason="ExpansionFailed",
-            message=f"Failed to expand PVCs: {exc}"
+            action="UpdatePVCTemplate",
+            reason="PVCTemplateUpdateFailed",
+            message=f"Failed to apply PVC template update: {exc}"
         )
         raise
 
@@ -1193,6 +1218,29 @@ def handle_fields(old, new, body: Body,
                 cluster.info(action="ReconcileResources", reason="SpecChanged", message=f"Field {prefix}{cr_name} modified")
                 handler(o, n, body, cluster, patcher, logger)
 
+
+def recreate_missing_stateful_set(cluster: InnoDBCluster, logger: Logger) -> None:
+    """Recreate the primary StatefulSet from the cluster's current specification."""
+    statefulset = cluster_objects.prepare_cluster_stateful_set(
+        cluster, cluster.parsed_spec, logger)
+    kopf.adopt(statefulset)
+
+    try:
+        api_apps.create_namespaced_stateful_set(
+            namespace=cluster.namespace, body=statefulset)
+    except ApiException as exc:
+        # Another reconciliation may have restored it after our read.
+        if exc.status != 409:
+            raise
+        logger.info(
+            "StatefulSet %s/%s was recreated concurrently",
+            cluster.namespace, cluster.name)
+        return
+
+    logger.info(
+        "Recreated missing StatefulSet %s/%s from the current cluster spec",
+        cluster.namespace, cluster.name)
+
 @kopf.on.field(consts.GROUP, consts.VERSION, consts.INNODBCLUSTER_PLURAL,
                field="spec")  # type: ignore
 def on_spec(body: Body, diff, old, new, logger: Logger, **kwargs):
@@ -1214,8 +1262,13 @@ def on_spec(body: Body, diff, old, new, logger: Logger, **kwargs):
             raise kopf.TemporaryError("Unready cluster", delay=60)
 
         if not (sts:= cluster.get_stateful_set()):
-            logger.warning("STS doesn't exist yet. If this is a change during cluster start it might race and be lost")
-            raise kopf.TemporaryError("Unready STS", delay=60)
+            logger.warning(
+                "StatefulSet %s/%s is missing; recreating it from the current cluster spec",
+                cluster.namespace, cluster.name)
+            recreate_missing_stateful_set(cluster, logger)
+            # Retry the field handler after the API cache observes the new STS so
+            # non-StatefulSet changes in the same spec update are not skipped.
+            raise kopf.TemporaryError("StatefulSet recreated", delay=5)
 
         patcher = cluster_objects.InnoDBClusterObjectModifier(cluster, logger)
 
@@ -1321,7 +1374,7 @@ def on_failover_create(name: str, namespace: Optional[str], body: Body,
 
 @kopf.on.delete("", "v1", "pods",
                 labels={"component": "mysqlrouter"},
-                optional=True, eager=True)  # type: ignore
+                optional=True)  # type: ignore
 def on_router_pod_delete(body: Body, logger: Logger, namespace: str, **kwargs):
     logger.info("on_router_pod_delete")
     router_name = body["metadata"]["name"]
