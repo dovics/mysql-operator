@@ -3198,19 +3198,18 @@ class MySQLPod(K8sInterfaceObject):
         return self.check_condition(f"mysql.oracle.com/{gate}")
 
     def update_member_readiness_gate(self, gate: str, value: bool) -> None:
-        now = utils.isotime()
+        condition_type = f"mysql.oracle.com/{gate}"
+        if self.check_condition(condition_type) == value:
+            return
 
-        if self.check_condition(f"mysql.oracle.com/{gate}") != value:
-            changed = True
-        else:
-            changed = False
+        now = utils.isotime()
 
         patch = {"status": {
             "conditions": [{
-                "type": f"mysql.oracle.com/{gate}",
+                "type": condition_type,
                 "status": "True" if value else "False",
                 "lastProbeTime": '%s' % now,
-                "lastTransitionTime": '%s' % now if changed else None
+                "lastTransitionTime": '%s' % now
             }]}}
         self.pod = cast(api_client.V1Pod, api_core.patch_namespaced_pod_status(
             self.name, self.namespace, body=patch))
@@ -3229,19 +3228,34 @@ class MySQLPod(K8sInterfaceObject):
     def update_membership_status(self, member_id: str, role: str, status: str,
                                  view_id: str, version: str,
                                  joined: bool = False) -> None:
-        now = utils.isotime()
-        last_probe_time = now
-
         info = self.get_membership_info() or {}
-        if not info or info.get("role") != role or info.get("status") != status or info.get("groupViewId") != view_id or info.get("memberId") != member_id:
-            last_transition_time = now
-        else:
-            last_transition_time = info.get("lastTransitionTime")
+        desired_label = role if status == "ONLINE" else None
+        current_label = (self.metadata.labels or {}).get(
+            "mysql.oracle.com/cluster-role")
+        transition_changed = (
+            not info
+            or info.get("role") != role
+            or info.get("status") != status
+            or info.get("groupViewId") != view_id
+            or info.get("memberId") != member_id
+        )
+        membership_changed = (
+            transition_changed
+            or info.get("version") != version
+            or current_label != desired_label
+            or (joined and not info.get("joinTime"))
+        )
+        if not membership_changed:
+            return
+
+        now = utils.isotime()
+        last_transition_time = (
+            now if transition_changed else info.get("lastTransitionTime"))
 
         info.update({
             "memberId": member_id,
             "lastTransitionTime": last_transition_time,
-            "lastProbeTime": last_probe_time,
+            "lastProbeTime": now,
             "groupViewId": view_id,
             "status": status,
             "version": version,
@@ -3253,7 +3267,7 @@ class MySQLPod(K8sInterfaceObject):
         patch = {
             "metadata": {
                 "labels": {
-                    "mysql.oracle.com/cluster-role": role if status == "ONLINE" else None
+                    "mysql.oracle.com/cluster-role": desired_label
                 },
                 "annotations": {
                     "mysql.oracle.com/membership-info": json.dumps(info)

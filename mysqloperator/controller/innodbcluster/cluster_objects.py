@@ -6,6 +6,7 @@
 import random
 import string
 import time
+import copy
 from logging import Logger, getLogger
 import kopf
 from typing import List, Dict, Optional, cast
@@ -1336,6 +1337,18 @@ def update_template_property(sts: api_client.V1StatefulSet, property_name: str, 
     update_stateful_set_spec(sts, patch)
 
 
+def _effective_sts_spec(
+        patcher: 'InnoDBClusterObjectModifier') -> dict:
+    """Return the StatefulSet spec after applying accumulated merge patches."""
+    effective_spec = copy.deepcopy(patcher.sts.spec)
+    if patcher.server_sts_patch:
+        utils.merge_patch_object(
+            effective_spec,
+            copy.deepcopy(patcher.server_sts_patch["spec"]),
+            none_deletes=True)
+    return effective_spec
+
+
 def update_objects_for_subsystem(subsystem: InnoDBClusterSpecProperties,
                                  cluster: InnoDBCluster,
                                  patcher: 'InnoDBClusterObjectModifier',
@@ -1414,28 +1427,43 @@ def update_objects_for_subsystem(subsystem: InnoDBClusterSpecProperties,
     if subsystem in spec.add_to_sts_cbs:
         print(f"\t\tCurrent container count: {len(sts.spec.template.spec.containers)}")
         print(f"\t\tWalking over add_to_sts_cbs len={len(spec.add_to_sts_cbs[subsystem])}")
-        changed = False
         sts.spec = spec_to_dict(sts.spec)
+        before_spec = _effective_sts_spec(patcher)
+        before_sts_spec = copy.deepcopy(patcher.sts.spec)
+        before_patch = copy.deepcopy(patcher.server_sts_patch)
+        before_flags = (
+            patcher.sts_changed,
+            patcher.sts_template_changed,
+            patcher.sts_spec_changed,
+        )
         for add_to_sts_cb in spec.add_to_sts_cbs[subsystem]:
-            changed = True
             print("\t\t\tPatching STS")
             add_to_sts_cb(sts, patcher, logger)
+        changed = before_spec != _effective_sts_spec(patcher)
         if changed:
             # There might be configmap changes, which when mounted will change the server, so we rollover
             # For fine grained approache the get_configmap should return whether there are such changes that require
             # a restart. With a restart, for example, the Cluster1LFSGeneralLogEnableDisableEnable test will hang
             restart_patch = {"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":utils.isotime()}}}}}
             patcher.patch_sts(restart_patch)
+        else:
+            patcher.sts.spec = before_sts_spec
+            patcher.server_sts_patch = before_patch
+            (
+                patcher.sts_changed,
+                patcher.sts_template_changed,
+                patcher.sts_spec_changed,
+            ) = before_flags
 
         print(f"\t\t\tSTS {'patched' if changed else 'unchanged. No rollover upgrade!'}")
 
     if subsystem in spec.get_add_to_svc_cbs:
         print(f"\t\tWalking over get_add_to_svc_cbs len={len(spec.get_add_to_svc_cbs[subsystem])}")
-        changed = False
+        old_svc = copy.deepcopy(svc)
         for add_to_svc_cb in spec.get_add_to_svc_cbs[subsystem]:
-            changed = True
             print("\t\t\tPatching SVC")
             add_to_svc_cb(svc, logger)
+        changed = old_svc != svc
         if changed:
             api_core.replace_namespaced_service(svc.metadata.name, svc.metadata.namespace, svc)
 

@@ -75,8 +75,8 @@ class ClusterController:
         return self.cluster.name.replace("-", "_").replace(".", "_")
 
     def publish_status(self, diag: diagnose.ClusterStatus, logger: Logger) -> None:
-        cluster_status = self.cluster.get_cluster_status()
-        if cluster_status and cluster_status["status"] != diag.status.name:
+        current_status = self.cluster.get_cluster_status()
+        if current_status and current_status.get("status") != diag.status.name:
             self.cluster.info(action="ClusterStatus", reason="StatusChange",
                               message=f"Cluster status changed to {diag.status.name}. {len(diag.online_members)} member(s) ONLINE")
 
@@ -90,13 +90,19 @@ class ClusterController:
                 # TODO: Should we declare it a replica or wait it to be diagnosed as replica, if initDB.cluster_set succeeds?
                 type = diagnose.ClusterInClusterSetType.REPLICA_CANDIDATE
 
-        logger.info("Publishing cluster status")
         cluster_status = {
             "status": diag.status.name,
             "onlineInstances": len(diag.online_members),
             "type": type.value,
-            "lastProbeTime": utils.isotime()
         }
+        if current_status and all(
+                current_status.get(field) == value
+                for field, value in cluster_status.items()):
+            logger.info("Cluster status unchanged")
+            return
+
+        logger.info("Publishing cluster status")
+        cluster_status["lastProbeTime"] = utils.isotime()
         self.cluster.set_cluster_status(cluster_status)
 
     def probe_status(self, logger: Logger) -> diagnose.ClusterStatus:
@@ -731,11 +737,6 @@ class ClusterController:
             self.__remove_instance_aux(pod, logger, force)
         except Exception as e:
             logger.info(f"Exception {e} caught")
-        finally:
-            # Remove the membership finalizer to allow the pod to be removed
-            logger.info(f"remove_instance: Removing member finalizer")
-            pod.remove_member_finalizer(pod_body)
-            logger.info(f"remove_instance: Removed finalizer for pod {pod_body['metadata']['name']}")
 
     def __remove_instance_aux(self, pod: MySQLPod, logger: Logger, force: bool = False) -> None:
         print(f"Removing {pod.endpoint} from cluster FORCE={force}")
@@ -957,6 +958,16 @@ class ClusterController:
             self.reconcile_pod, diag.primary, pod, logger)
 
     def on_pod_deleted(self, pod: MySQLPod, pod_body: Body, logger: Logger) -> None:
+        try:
+            self._on_pod_deleted(pod, pod_body, logger)
+        finally:
+            # Cluster cleanup is best effort. Never leave a Pod stuck in
+            # Terminating when diagnosis, repair, or cluster teardown fails.
+            logger.info(
+                f"on_pod_deleted: Removing membership finalizer from {pod.name}")
+            pod.remove_member_finalizer(pod_body)
+
+    def _on_pod_deleted(self, pod: MySQLPod, pod_body: Body, logger: Logger) -> None:
         diag = self.probe_status(logger)
 
         logger.info(f"on_pod_deleted: {pod.name} pod.phase={pod.phase} cluster.instances={self.cluster.parsed_spec.instances} online={diag.online_members}  primary={diag.primary}  cluster_state={diag.status} cluster.deleting={self.cluster.deleting}")
@@ -966,8 +977,6 @@ class ClusterController:
             # cluster is being deleted, if this is pod-0 shut it down
             if pod.index == 0:
                 self.destroy_cluster(pod, logger)
-                logger.info("on_pod_deleted: Removing member finalizer")
-                pod.remove_member_finalizer(pod_body)
                 return
 
         if pod.deleting and diag.status in (diagnose.ClusterDiagStatus.ONLINE, diagnose.ClusterDiagStatus.ONLINE_PARTIAL, diagnose.ClusterDiagStatus.ONLINE_UNCERTAIN, diagnose.ClusterDiagStatus.FINALIZING):
@@ -976,7 +985,6 @@ class ClusterController:
                 self.remove_instance, pod, pod_body, logger)
         elif self.cluster.parsed_spec.instances == 1 and len(diag.online_members) == 0 and pod.phase == "Failed":
             logger.info("One node cluster and the instance is offline. We won't attempt a repair but let k8s to recreate the pod")
-            pod.remove_member_finalizer(pod_body)
             # we can't do when the only pod is offline
             # if we try to repair nothing will happen and then throw a TemporaryError then the Kopf Finalizer
             # will stay attached to the pod and the pod will hang indefinitely in Terminating (Failed) state
@@ -990,7 +998,6 @@ class ClusterController:
             # ONLINE_PARTIAL and there won't be endless loop by the KopfMemberFinalizer and the TemporaryError.
         else:
             logger.info(f"on_pod_deleted: {pod.name} ATTEMPTING CLUSTER REPAIR")
-            pod.remove_member_finalizer(pod_body)
             self.repair_cluster(pod, diag, logger)
             # Retry from scratch in another iteration
             logger.info("on_pod_deleted: RETRYING ON POD DELETE")

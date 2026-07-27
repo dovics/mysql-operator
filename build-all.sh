@@ -18,10 +18,9 @@ NC='\033[0m' # No Color
 
 # Configuration
 PYTHON_VERSION="3.13.9"
-PYTHON_TARBALL="Python-${PYTHON_VERSION}.tgz"
-PYTHON_DOWNLOAD_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_TARBALL}"
-PYTHON_DEPS_IMAGE="mysql-operator-python-deps:${PYTHON_VERSION}-amd64"
-OPERATOR_IMAGE_TAG=${OPERATOR_IMAGE_TAG:-"mysql/community-operator"}
+PLATFORMS=${PLATFORMS:-"linux/amd64,linux/arm64"}
+PYTHON_DEPS_IMAGE=${PYTHON_DEPS_IMAGE:-"harbor-dev.insightst.com/infra/mysql-operator-python-deps:${PYTHON_VERSION}"}
+OPERATOR_IMAGE_TAG=${OPERATOR_IMAGE_TAG:-"harbor-dev.insightst.com/infra/mysql/community-operator"}
 BUILD_DIR="/tmp/mysql-operator-build"
 CURRENT_DIR="$(pwd)"
 
@@ -58,76 +57,19 @@ check_dependencies() {
     fi
     print_success "Docker is installed"
 
-    # Check if uv is installed
-    if ! command -v uv &> /dev/null; then
-        print_warning "uv is not installed. Installing uv..."
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        export PATH="$HOME/.local/bin:$PATH"
-        if ! command -v uv &> /dev/null; then
-            print_error "Failed to install uv. Please install manually."
-            exit 1
-        fi
+    if ! docker buildx version &> /dev/null; then
+        print_error "Docker Buildx is not available. Please install/enable the buildx plugin."
+        exit 1
     fi
-    print_success "uv is installed: $(uv --version)"
-}
-
-download_python() {
-    print_header "Downloading Python ${PYTHON_VERSION}"
-
-    # Check if tarball already exists
-    if [ -f "${PYTHON_TARBALL}" ]; then
-        print_warning "Python tarball already exists. Skipping download."
-        return
-    fi
-
-    print_step "Downloading Python ${PYTHON_VERSION} from ${PYTHON_DOWNLOAD_URL}"
-    if wget --no-proxy "${PYTHON_DOWNLOAD_URL}"; then
-        print_success "Python tarball downloaded successfully"
-    else
-        print_error "Failed to download Python tarball"
-        print_step "Trying alternative download method..."
-        if curl -L -o "${PYTHON_TARBALL}" "${PYTHON_DOWNLOAD_URL}"; then
-            print_success "Python tarball downloaded successfully with curl"
-        else
-            print_error "Failed to download Python tarball with both wget and curl"
-            exit 1
-        fi
-    fi
-}
-
-setup_python_environment() {
-    print_header "Setting Up Python Environment"
-
-    print_step "Creating build directory: ${BUILD_DIR}"
-    rm -rf "${BUILD_DIR}"
-    mkdir -p "${BUILD_DIR}"
-    cd "${BUILD_DIR}"
-
-    # Create Python virtual environment with uv
-    print_step "Creating Python ${PYTHON_VERSION} virtual environment with uv"
-    uv venv --python "${PYTHON_VERSION}" || {
-        print_error "Failed to create Python ${PYTHON_VERSION} virtual environment"
-        print_step "Trying with latest Python 3.13..."
-        uv venv --python 3.13
-    }
-    print_success "Virtual environment created"
-
-    # Install dependencies
-    print_step "Installing Python dependencies with uv (using --no-deps for CVE fix)"
-    uv pip install -r "${CURRENT_DIR}/docker-deps/requirements.txt" \
-        --python "${BUILD_DIR}/.venv/bin/python" \
-        --no-deps
-    print_success "Dependencies installed"
-
-    # Copy site-packages
-    print_step "Copying site-packages to build directory"
-    mkdir -p "${BUILD_DIR}/site-packages"
-    cp -r "${BUILD_DIR}/.venv/lib/python"*/site-packages/* "${BUILD_DIR}/site-packages/"
-    print_success "Site-packages copied"
+    print_success "Docker Buildx is installed"
 }
 
 build_python_deps_image() {
     print_header "Building Python Dependencies Image"
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cp "${CURRENT_DIR}/docker-deps/requirements.txt" "${BUILD_DIR}/requirements.txt"
 
     print_step "Creating Dockerfile for Python dependencies"
     cat > "${BUILD_DIR}/Dockerfile" <<'EOF'
@@ -159,11 +101,12 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV PYTHONPATH=/usr/lib/mysqlsh/python-packages
 ENV PYTHONUNBUFFERED=1
 
-# Copy the site-packages directory
-COPY site-packages/ /usr/lib/mysqlsh/python-packages/
-
-# Create directory structure
-RUN mkdir -p /usr/lib/mysqlsh/python-packages
+# Install dependencies for the current buildx target architecture.
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir --no-deps \
+      --target /usr/lib/mysqlsh/python-packages \
+      -r /tmp/requirements.txt && \
+    rm -f /tmp/requirements.txt
 
 # Verify the installation
 RUN python3 -c "import sys; print(f'Python version: {sys.version}')" && \
@@ -175,9 +118,13 @@ RUN python3 -c "import sys; print(f'Python version: {sys.version}')" && \
 CMD ["/bin/bash"]
 EOF
 
-    print_step "Building ${PYTHON_DEPS_IMAGE}"
-    if docker build -t "${PYTHON_DEPS_IMAGE}" "${BUILD_DIR}"; then
-        print_success "Python dependencies image built successfully"
+    print_step "Building and pushing ${PYTHON_DEPS_IMAGE} for ${PLATFORMS}"
+    if docker buildx build \
+        --platform "${PLATFORMS}" \
+        --push \
+        -t "${PYTHON_DEPS_IMAGE}" \
+        "${BUILD_DIR}"; then
+        print_success "Python dependencies multi-platform image built and pushed"
     else
         print_error "Failed to build Python dependencies image"
         exit 1
@@ -197,15 +144,18 @@ build_operator_image() {
 
     # Get operator tag
     OPERATOR_TAG=$("${CURRENT_DIR}/tag.sh")
-    print_step "Building operator image: ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64"
+    print_step "Building and pushing operator image: ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG} (${PLATFORMS})"
 
-    if docker build --build-arg "http_proxy=${http_proxy:-}" \
+    if docker buildx build \
+                    --platform "${PLATFORMS}" \
+                    --push \
+                    --build-arg "PYTHON_DEPS_IMAGE=${PYTHON_DEPS_IMAGE}" \
+                    --build-arg "http_proxy=${http_proxy:-}" \
                     --build-arg "https_proxy=${https_proxy:-}" \
                     --build-arg "no_proxy=${no_proxy:-}" \
                     -f Dockerfile \
-                    -t "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64" \
                     -t "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}" .; then
-        print_success "Operator image built successfully"
+        print_success "Operator multi-platform image built and pushed"
     else
         print_error "Failed to build operator image"
         exit 1
@@ -215,7 +165,18 @@ build_operator_image() {
 verify_images() {
     print_header "Verifying Built Images"
 
-    # Verify Python deps image
+    for image in "${PYTHON_DEPS_IMAGE}" "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}"; do
+        manifest=$(docker buildx imagetools inspect "${image}")
+        for platform in ${PLATFORMS//,/ }; do
+            if ! grep -q "Platform:.*${platform}" <<< "${manifest}"; then
+                print_error "${image} manifest does not contain ${platform}"
+                exit 1
+            fi
+        done
+        print_success "${image} manifest contains ${PLATFORMS}"
+    done
+
+    # Pulling/running the tag selects the current host architecture from the manifest.
     print_step "Verifying ${PYTHON_DEPS_IMAGE}"
     docker run --rm "${PYTHON_DEPS_IMAGE}" python3 -c "
 import sys
@@ -232,14 +193,6 @@ print(urllib3.__version__)
 
     # Verify operator image
     OPERATOR_TAG=$("${CURRENT_DIR}/tag.sh")
-    print_step "Verifying ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64"
-    docker run --rm "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64" sh -c '
-echo "✓ Python: $(python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\")")"
-echo "✓ MySQL Shell: $(mysqlsh --version | grep -oP \"Ver \K[0-9.]+\")"
-echo "✓ Operator code: $(ls /usr/lib/mysqlsh/python-packages/mysqloperator/ | wc -l) files"
-'
-    print_success "Operator image (amd64) verified"
-
     print_step "Verifying ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}"
     docker run --rm "${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}" sh -c '
 echo "✓ Python: $(python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\")")"
@@ -272,8 +225,8 @@ show_summary() {
 
     echo "Built Images:"
     echo "  • ${PYTHON_DEPS_IMAGE}"
-    echo "  • ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}-amd64"
     echo "  • ${OPERATOR_IMAGE_TAG}:${OPERATOR_TAG}"
+    echo "Platforms: ${PLATFORMS}"
     echo ""
 
     echo "Next Steps:"
@@ -293,8 +246,6 @@ main() {
     sleep 2
 
     check_dependencies
-    download_python
-    setup_python_environment
     build_python_deps_image
     build_operator_image
     verify_images
@@ -319,8 +270,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --help          Show this help message"
             echo ""
             echo "This script automates the build process for MySQL Operator images."
-            echo "It will download Python, install dependencies, and build both the"
-            echo "Python dependencies image and the main MySQL Operator image."
+            echo "It builds and pushes linux/amd64 and linux/arm64 manifests for both"
+            echo "the Python dependencies image and the main MySQL Operator image."
             exit 0
             ;;
         *)
